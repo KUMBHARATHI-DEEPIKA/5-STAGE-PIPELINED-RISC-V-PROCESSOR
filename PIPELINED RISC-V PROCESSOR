@@ -1,0 +1,283 @@
+module riscv_pipeline(
+    input logic clk,rst);
+    // PC / IF
+    logic [31:0] pc,pc_next, pc_plus4;
+    logic [31:0] instr;
+    // IF/ID PIPELINE REGISTER
+    logic [31:0] if_id_pc;
+    logic [31:0] if_id_pc_plus4;
+    logic [31:0] if_id_instr;
+    // ID STAGE
+    logic [31:0] rd1,rd2;
+    logic [31:0] imm_ext;
+    logic [31:0] wb_result;
+    logic [1:0] id_result_src;
+    logic id_mem_write;
+    logic  id_branch;
+    logic  id_alu_src;
+    logic  id_reg_write;
+    logic   id_jump;
+    logic [1:0] id_imm_src;
+    logic [2:0] id_alu_control;
+    // ID/EX PIPELINE REGISTER
+    logic [31:0] id_ex_pc;
+    logic [31:0] id_ex_pc_plus4;
+    logic [31:0] id_ex_rd1,id_ex_rd2;
+    logic [31:0] id_ex_imm;
+    logic [4:0] id_ex_rs1,id_ex_rs2,rd;
+    logic [1:0] id_ex_result_src;
+    logic id_ex_mem_write;
+    logic  id_ex_branch;
+    logic  id_ex_alu_src;
+    logic   id_ex_reg_write;
+    logic id_ex_jump;
+    logic [2:0] id_ex_alu_control;
+    // EX STAGE
+    logic [31:0] alu_src_a;
+    logic [31:0] alu_src_b;
+    logic [31:0] alu_result_ex;
+    logic zero_ex;
+    logic [31:0] branch_target;
+    logic branch_taken;
+    // FORWARDING
+    logic [1:0] forward_a;
+    logic [1:0] forward_b;
+    // EX/MEM PIPELINE REGISTER
+    logic [31:0] ex_mem_alu_result;
+    logic [31:0] ex_mem_write_data;
+    logic [31:0] ex_mem_pc_plus4;
+    logic [4:0] ex_mem_rd;
+    logic [1:0] ex_mem_result_src;
+    logic  ex_mem_mem_write;
+    logic  ex_mem_reg_write;
+    // MEMORY
+    logic [31:0] mem_read_data;
+    // MEM/WB PIPELINE REGISTER
+    logic [31:0] mem_wb_mem_data;
+    logic [31:0] mem_wb_alu_result;
+    logic [31:0] mem_wb_pc_plus4;
+    logic [4:0] mem_wb_rd;
+    logic [1:0] mem_wb_result_src;
+    logic mem_wb_reg_write;
+    // HAZARD
+    logic stall;
+    // PC + 4
+    assign pc_plus4 = pc + 32'd4;
+    // INSTRUCTION MEMORY
+    Ins_mem imem(.a(pc),.rd(instr));
+    // REGISTER FILE
+    reg_file rf(.clk(clk),.we3(mem_wb_reg_write),.a1(if_id_instr[19:15]),.a2(if_id_instr[24:20]),.a3(mem_wb_rd),.wd3(wb_result),.rd1(rd1),.rd2(rd2),.rd3());
+    // CONTROLLER
+    controller ctrl(.op(if_id_instr[6:0]),.funct3(if_id_instr[14:12]),.funct7b5(if_id_instr[30]),.result_src(id_result_src),.mem_write(id_mem_write),.branch(id_branch),.alu_src(id_alu_src),.reg_write(id_reg_write),.jump(id_jump),.imm_src(id_imm_src),.alu_control(id_alu_control));
+    // IMMEDIATE GENERATOR
+    extend extender(.instr(if_id_instr[31:7]),.imm_src(id_imm_src),.imm_ext(imm_ext));
+    // HAZARD DETECTION
+    hazard_unit hazard(.id_ex_mem_read(id_ex_result_src == 2'b01),.id_ex_rd(id_ex_rd),.if_id_rs1(if_id_instr[19:15]),.if_id_rs2(if_id_instr[24:20]),.stall(stall));
+    // FORWARDING UNIT
+    forwarding_unit forwarding(.id_ex_rs1(id_ex_rs1),.id_ex_rs2(id_ex_rs2),.ex_mem_rd(ex_mem_rd),.ex_mem_reg_write(ex_mem_reg_write),.mem_wb_rd(mem_wb_rd),.mem_wb_reg_write(mem_wb_reg_write),.forward_a(forward_a),.forward_b(forward_b));
+    // FORWARD ALU INPUT A
+    always_comb begin
+        case (forward_a)
+            2'b00:
+                alu_src_a = id_ex_rd1;
+            2'b01:
+                alu_src_a = wb_result;
+            2'b10:
+                alu_src_a = ex_mem_alu_result;
+            default:
+                alu_src_a = id_ex_rd1;
+        endcase
+    end
+    // FORWARD ALU INPUT B
+    logic [31:0] forwarded_rs2;
+    always_comb begin
+        case (forward_b)
+            2'b00:
+                forwarded_rs2 = id_ex_rd2;
+            2'b01:
+                forwarded_rs2 = wb_result;
+            2'b10:
+                forwarded_rs2 = ex_mem_alu_result;
+            default:
+                forwarded_rs2 = id_ex_rd2;
+        endcase
+    end
+    // ALU SOURCE B MUX
+    always_comb begin
+        if (id_ex_alu_src)
+            alu_src_b = id_ex_imm;
+        else
+            alu_src_b = forwarded_rs2;
+    end
+    // ALU
+    ALU alu_unit(.a(alu_src_a),.b(alu_src_b),.alu_control(id_ex_alu_control),.alu_result(alu_result_ex),.zero(zero_ex));
+    // BRANCH 
+    assign branch_target = id_ex_pc + id_ex_imm;
+    // BRANCH / JUMP DECISION
+    assign branch_taken = id_ex_jump | (id_ex_branch & zero_ex);
+    // NEXT PC
+    always_comb begin
+        if (branch_taken)
+            pc_next = branch_target;
+        else
+            pc_next = pc_plus4;
+    end
+    // PC REGISTER
+    always_ff @(posedge clk) begin
+        if (rst)
+            pc <= 32'b0;
+        else if (!stall || branch_taken)
+            pc <= pc_next;
+    end
+    // IF/ID PIPELINE REGISTER
+    always_ff @(posedge clk) begin
+        if (rst) begin
+            if_id_pc       <= 32'b0;
+            if_id_pc_plus4 <= 32'b0;
+            if_id_instr    <= 32'b0;
+        end
+        else if (branch_taken) begin
+            // FLUSH WRONG INSTRUCTIONS
+            if_id_pc       <= 32'b0;
+            if_id_pc_plus4 <= 32'b0;
+            if_id_instr    <= 32'h00000013;
+        end
+        else if (!stall) begin
+            if_id_pc       <= pc;
+            if_id_pc_plus4 <= pc_plus4;
+            if_id_instr    <= instr;
+        end
+    end
+    // ID/EX PIPELINE REGISTER
+    always_ff @(posedge clk) begin
+        if (rst) begin
+            id_ex_pc          <= 32'b0;
+            id_ex_pc_plus4    <= 32'b0;
+            id_ex_rd1         <= 32'b0;
+            id_ex_rd2         <= 32'b0;
+            id_ex_imm         <= 32'b0;
+            id_ex_rs1         <= 5'b0;
+            id_ex_rs2         <= 5'b0;
+            id_ex_rd          <= 5'b0;
+            id_ex_result_src  <= 2'b00;
+            id_ex_mem_write   <= 1'b0;
+            id_ex_branch      <= 1'b0;
+            id_ex_alu_src     <= 1'b0;
+            id_ex_reg_write   <= 1'b0;
+            id_ex_jump        <= 1'b0;
+            id_ex_alu_control  <= 3'b000;
+        end
+        else if (branch_taken) begin
+            // FLUSH ID/EX
+            id_ex_pc          <= 32'b0;
+            id_ex_pc_plus4    <= 32'b0;
+            id_ex_rd1         <= 32'b0;
+            id_ex_rd2         <= 32'b0;
+            id_ex_imm         <= 32'b0;
+            id_ex_rs1         <= 5'b0;
+            id_ex_rs2         <= 5'b0;
+            id_ex_rd          <= 5'b0;
+            id_ex_result_src  <= 2'b00;
+            id_ex_mem_write   <= 1'b0;
+            id_ex_branch      <= 1'b0;
+            id_ex_alu_src     <= 1'b0;
+            id_ex_reg_write   <= 1'b0;
+            id_ex_jump        <= 1'b0;
+            id_ex_alu_control <= 3'b000;
+        end
+        else if (stall) begin
+            // INSERT BUBBLE
+            id_ex_pc          <= 32'b0;
+            id_ex_pc_plus4    <= 32'b0;
+            id_ex_rd1         <= 32'b0;
+            id_ex_rd2         <= 32'b0;
+            id_ex_imm         <= 32'b0;
+            id_ex_rs1         <= 5'b0;
+            id_ex_rs2         <= 5'b0;
+            id_ex_rd          <= 5'b0;
+            id_ex_result_src  <= 2'b00;
+            id_ex_mem_write   <= 1'b0;
+            id_ex_branch      <= 1'b0;
+            id_ex_alu_src     <= 1'b0;
+            id_ex_reg_write   <= 1'b0;
+            id_ex_jump        <= 1'b0;
+            id_ex_alu_control <= 3'b000;
+        end
+        else begin
+            id_ex_pc       <= if_id_pc;
+            id_ex_pc_plus4 <= if_id_pc_plus4;
+            id_ex_rd1      <= rd1;
+            id_ex_rd2      <= rd2;
+            id_ex_imm      <= imm_ext;
+            id_ex_rs1      <= if_id_instr[19:15];
+            id_ex_rs2      <= if_id_instr[24:20];
+            id_ex_rd       <= if_id_instr[11:7];
+            id_ex_result_src <= id_result_src;
+            id_ex_mem_write <= id_mem_write;
+            id_ex_branch    <= id_branch;
+            id_ex_alu_src   <= id_alu_src;
+            id_ex_reg_write <= id_reg_write;
+            id_ex_jump      <= id_jump;
+            id_ex_alu_control <= id_alu_control;
+        end
+    end
+    // EX/MEM PIPELINE REGISTER
+    always_ff @(posedge clk) begin
+        if (rst) begin
+            ex_mem_alu_result <= 32'b0;
+            ex_mem_write_data <= 32'b0;
+            ex_mem_pc_plus4   <= 32'b0;
+            ex_mem_rd         <= 5'b0;
+            ex_mem_result_src <= 2'b00;
+            ex_mem_mem_write  <= 1'b0;
+            ex_mem_reg_write  <= 1'b0;
+        end
+        else begin
+            ex_mem_alu_result <= alu_result_ex;
+            // store data also needs forwarding
+            ex_mem_write_data <= forwarded_rs2;
+            ex_mem_pc_plus4   <= id_ex_pc_plus4;
+            ex_mem_rd         <= id_ex_rd;
+            ex_mem_result_src <= id_ex_result_src;
+            ex_mem_mem_write  <= id_ex_mem_write;
+            ex_mem_reg_write  <= id_ex_reg_write;
+        end
+    end
+    // DATA MEMORY
+    data_mem dmem(.clk(clk),.we(ex_mem_mem_write),.a(ex_mem_alu_result),.wd(ex_mem_write_data),.rd(mem_read_data));
+    // MEM/WB PIPELINE REGISTER
+    always_ff @(posedge clk) begin
+        if (rst) begin
+            mem_wb_mem_data   <= 32'b0;
+            mem_wb_alu_result <= 32'b0;
+            mem_wb_pc_plus4   <= 32'b0;
+            mem_wb_rd         <= 5'b0;
+            mem_wb_result_src <= 2'b00;
+            mem_wb_reg_write  <= 1'b0;
+        end
+        else begin
+            mem_wb_mem_data   <= mem_read_data;
+            mem_wb_alu_result <= ex_mem_alu_result;
+            mem_wb_pc_plus4   <= ex_mem_pc_plus4;
+            mem_wb_rd         <= ex_mem_rd;
+            mem_wb_result_src <= ex_mem_result_src;
+            mem_wb_reg_write  <= ex_mem_reg_write;
+        end
+    end
+    // WRITE BACK
+    always_comb begin
+        case (mem_wb_result_src)
+            // ALU result
+            2'b00:
+                wb_result = mem_wb_alu_result;
+            // Memory data
+            2'b01:
+                wb_result = mem_wb_mem_data;
+            // PC + 4
+            2'b10:
+                wb_result = mem_wb_pc_plus4;
+            default:
+                wb_result = 32'b0;
+        endcase
+    end
+endmodule
